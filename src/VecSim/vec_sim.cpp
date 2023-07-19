@@ -7,19 +7,23 @@
 #include "VecSim/vec_sim.h"
 #include "VecSim/query_results.h"
 #include "VecSim/query_result_struct.h"
-#include "VecSim/algorithms/brute_force/brute_force.h"
-#include "VecSim/algorithms/hnsw/hnsw.h"
 #include "VecSim/utils/vec_utils.h"
 #include "VecSim/utils/arr_cpp.h"
-#include "VecSim/algorithms/brute_force/brute_force_factory.h"
-#include "VecSim/algorithms/hnsw/hnsw_factory.h"
 #include "VecSim/algorithms/raft_ivf/ivf_factory.h"
+#include "VecSim/index_factories/index_factory.h"
+#include "VecSim/vec_sim_index.h"
 #include <cassert>
 #include "memory.h"
 
 extern "C" void VecSim_SetTimeoutCallbackFunction(timeoutCallbackFunction callback) {
     VecSimIndex::setTimeoutCallbackFunction(callback);
 }
+
+extern "C" void VecSim_SetLogCallbackFunction(logCallbackFunction callback) {
+    VecSimIndex::setLogCallbackFunction(callback);
+}
+
+extern "C" void VecSim_SetWriteMode(VecSimWriteMode mode) { VecSimIndex::setWriteMode(mode); }
 
 static VecSimResolveCode _ResolveParams_EFRuntime(VecSimAlgo index_type, VecSimRawParam rparam,
                                                   VecSimQueryParams *qparams,
@@ -101,76 +105,27 @@ static VecSimResolveCode _ResolveParams_HybridPolicy(VecSimRawParam rparam,
 }
 
 extern "C" VecSimIndex *VecSimIndex_New(const VecSimParams *params) {
-    VecSimIndex *index = NULL;
-    std::shared_ptr<VecSimAllocator> allocator = VecSimAllocator::newVecsimAllocator();
-    try {
-        switch (params->algo) {
-        case VecSimAlgo_HNSWLIB:
-            index = HNSWFactory::NewIndex(&params->hnswParams, allocator);
-            break;
-        case VecSimAlgo_BF:
-            index = BruteForceFactory::NewIndex(&params->bfParams, allocator);
-            break;
-        case VecSimAlgo_RaftIVFFlat:
-            index = RaftIVFFlatFactory::NewIndex(&params->raftIVFFlatParams, allocator);
-            break;
-        case VecSimAlgo_RaftIVFPQ:
-            index = RaftIVFPQFactory::NewIndex(&params->raftIVFPQParams, allocator);
-            break;
-        }
-    } catch (...) {
-        // Index will delete itself. For now, do nothing.
-    }
-    return index;
+    return VecSimFactory::NewIndex(params);
 }
 
 extern "C" size_t VecSimIndex_EstimateInitialSize(const VecSimParams *params) {
-    switch (params->algo) {
-    case VecSimAlgo_HNSWLIB:
-        return HNSWFactory::EstimateInitialSize(&params->hnswParams);
-    case VecSimAlgo_BF:
-        return BruteForceFactory::EstimateInitialSize(&params->bfParams);
-    case VecSimAlgo_RaftIVFFlat:
-        return RaftIVFFlatFactory::EstimateInitialSize(&params->raftIVFFlatParams);
-    case VecSimAlgo_RaftIVFPQ:
-        return RaftIVFPQFactory::EstimateInitialSize(&params->raftIVFPQParams);
-    }
-    return -1;
+    return VecSimFactory::EstimateInitialSize(params);
 }
 
-extern "C" int VecSimIndex_AddVector(VecSimIndex *index, const void *blob, size_t id) {
-    int64_t before = index->getAllocationSize();
-    if (index->indexSize() == index->indexCapacity()) {
-        index->increaseCapacity();
-    }
-    index->addVector(blob, id, true);
-    int64_t after = index->getAllocationSize();
-    return after - before;
+extern "C" int VecSimIndex_AddVector(VecSimIndex *index, const void *blob, size_t label) {
+    return index->addVectorWrapper(blob, label);
 }
 
-extern "C" int VecSimIndex_DeleteVector(VecSimIndex *index, size_t id) {
-    int64_t before = index->getAllocationSize();
-    index->deleteVector(id);
-    int64_t after = index->getAllocationSize();
-    return after - before;
+extern "C" int VecSimIndex_DeleteVector(VecSimIndex *index, size_t label) {
+    return index->deleteVector(label);
 }
 
-extern "C" double VecSimIndex_GetDistanceFrom(VecSimIndex *index, size_t id, const void *blob) {
-    return index->getDistanceFrom(id, blob);
+extern "C" double VecSimIndex_GetDistanceFrom(VecSimIndex *index, size_t label, const void *blob) {
+    return index->getDistanceFrom(label, blob);
 }
 
 extern "C" size_t VecSimIndex_EstimateElementSize(const VecSimParams *params) {
-    switch (params->algo) {
-    case VecSimAlgo_HNSWLIB:
-        return HNSWFactory::EstimateElementSize(&params->hnswParams);
-    case VecSimAlgo_BF:
-        return BruteForceFactory::EstimateElementSize(&params->bfParams);
-    case VecSimAlgo_RaftIVFFlat:
-        return RaftIVFFlatFactory::EstimateElementSize(&params->raftIVFFlatParams);
-    case VecSimAlgo_RaftIVFPQ:
-        return RaftIVFPQFactory::EstimateElementSize(&params->raftIVFPQParams);
-    }
-    return -1;
+    return VecSimFactory::EstimateElementSize(params);
 }
 
 extern "C" void VecSim_Normalize(void *blob, size_t dim, VecSimType type) {
@@ -190,7 +145,8 @@ extern "C" VecSimResolveCode VecSimIndex_ResolveParams(VecSimIndex *index, VecSi
     if (!qparams || (!rparams && (paramNum != 0))) {
         return VecSimParamResolverErr_NullParam;
     }
-    VecSimAlgo index_type = index->info().algo;
+    VecSimAlgo index_type = index->basicInfo().algo;
+
     bzero(qparams, sizeof(VecSimQueryParams));
     auto res = VecSimParamResolver_OK;
     for (int i = 0; i < paramNum; i++) {
@@ -240,7 +196,7 @@ extern "C" VecSimQueryResult_List VecSimIndex_TopKQuery(VecSimIndex *index, cons
     assert((order == BY_ID || order == BY_SCORE) &&
            "Possible order values are only 'BY_ID' or 'BY_SCORE'");
     VecSimQueryResult_List results;
-    results = index->topKQuery(queryBlob, k, queryParams);
+    results = index->topKQueryWrapper(queryBlob, k, queryParams);
 
     if (order == BY_ID) {
         sort_results_by_id(results);
@@ -258,14 +214,7 @@ extern "C" VecSimQueryResult_List VecSimIndex_RangeQuery(VecSimIndex *index, con
     if (radius < 0) {
         throw std::runtime_error("radius must be non-negative");
     }
-    VecSimQueryResult_List results = index->rangeQuery(queryBlob, radius, queryParams);
-
-    if (order == BY_SCORE) {
-        sort_results_by_score(results);
-    } else {
-        sort_results_by_id(results);
-    }
-    return results;
+    return index->rangeQueryWrapper(queryBlob, radius, queryParams, order);
 }
 
 extern "C" void VecSimIndex_Free(VecSimIndex *index) {
@@ -280,9 +229,19 @@ extern "C" VecSimInfoIterator *VecSimIndex_InfoIterator(VecSimIndex *index) {
     return index->infoIterator();
 }
 
+extern "C" VecSimIndexBasicInfo VecSimIndex_BasicInfo(VecSimIndex *index) {
+    return index->basicInfo();
+}
+
 extern "C" VecSimBatchIterator *VecSimBatchIterator_New(VecSimIndex *index, const void *queryBlob,
                                                         VecSimQueryParams *queryParams) {
-    return index->newBatchIterator(queryBlob, queryParams);
+    return index->newBatchIteratorWrapper(queryBlob, queryParams);
+}
+
+extern "C" void VecSimTieredIndex_GC(VecSimIndex *index) {
+    if (index->basicInfo().isTiered) {
+        index->runGC();
+    }
 }
 
 extern "C" void VecSim_SetMemoryFunctions(VecSimMemoryFunctions memoryfunctions) {

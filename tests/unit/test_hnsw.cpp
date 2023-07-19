@@ -7,11 +7,10 @@
 #include "gtest/gtest.h"
 #include "VecSim/vec_sim.h"
 #include "VecSim/algorithms/hnsw/hnsw_single.h"
-#include "VecSim/algorithms/hnsw/hnsw_factory.h"
+#include "VecSim/index_factories/hnsw_factory.h"
 #include "test_utils.h"
 #include "VecSim/utils/serializer.h"
 #include "VecSim/query_result_struct.h"
-#include <climits>
 #include <unistd.h>
 #include <random>
 #include <thread>
@@ -63,7 +62,7 @@ TYPED_TEST(HNSWTest, hnsw_blob_sanity_test) {
     size_t bs = 1;
 #define ASSERT_HNSW_BLOB_EQ(id, blob)                                                              \
     do {                                                                                           \
-        void *v = hnsw_index->getDataByInternalId(id);                                             \
+        const void *v = hnsw_index->getDataByInternalId(id);                                       \
         ASSERT_FALSE(memcmp(v, blob, sizeof(blob)));                                               \
     } while (0)
 
@@ -116,7 +115,7 @@ TYPED_TEST(HNSWTest, hnsw_blob_sanity_test) {
 /**** resizing cases ****/
 
 // Add up to capacity.
-TYPED_TEST(HNSWTest, resizeNAlignIndex) {
+TYPED_TEST(HNSWTest, resizeIndex) {
     size_t dim = 4;
     size_t n = 10;
     size_t bs = 3;
@@ -130,43 +129,42 @@ TYPED_TEST(HNSWTest, resizeNAlignIndex) {
     for (size_t i = 0; i < n; i++) {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
     }
-    // The size and the capacity should be equal.
-    HNSWIndex<TEST_DATA_T, TEST_DIST_T> *hnswIndex = this->CastToHNSW(index);
-    ASSERT_EQ(hnswIndex->indexCapacity(), VecSimIndex_IndexSize(index));
+
+    // Initial capacity is rounded up to the block size.
+    size_t extra_cap = n % bs == 0 ? 0 : bs - n % bs;
+    // The size (+extra) and the capacity should be equal.
+    ASSERT_EQ(index->indexCapacity(), VecSimIndex_IndexSize(index) + extra_cap);
     // The capacity shouldn't be changed.
-    ASSERT_EQ(hnswIndex->indexCapacity(), n);
+    ASSERT_EQ(index->indexCapacity(), n + extra_cap);
 
-    // Add another vector to exceed the initial capacity.
-    GenerateAndAddVector<TEST_DATA_T>(index, dim, n);
-
-    // The capacity should be now aligned with the block size.
-    // bs = 3, size = 11 -> capacity = 12
-    // New capacity = initial capacity + blockSize - initial capacity % blockSize.
-    ASSERT_EQ(hnswIndex->indexCapacity(), n + bs - n % bs);
     VecSimIndex_Free(index);
 }
 
 // Case 1: initial capacity is larger than block size, and it is not aligned.
-TYPED_TEST(HNSWTest, resizeNAlignIndex_largeInitialCapacity) {
+TYPED_TEST(HNSWTest, resizeIndex_largeInitialCapacity) {
     size_t dim = 4;
     size_t n = 10;
     size_t bs = 3;
+
+    // Initial capacity is rounded up to the block size.
+    size_t extra_cap = n % bs == 0 ? 0 : bs - n % bs;
 
     HNSWParams params = {
         .dim = dim, .metric = VecSimMetric_L2, .initialCapacity = n, .blockSize = bs};
 
     VecSimIndex *index = this->CreateNewIndex(params);
+    size_t curr_capacity = index->indexCapacity();
 
     ASSERT_EQ(VecSimIndex_IndexSize(index), 0);
+    ASSERT_EQ(curr_capacity, n + extra_cap);
 
     // add up to blocksize + 1 = 3 + 1 = 4
     for (size_t i = 0; i < bs + 1; i++) {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
     }
 
-    // The capacity shouldn't change, should remain n.
-    HNSWIndex<TEST_DATA_T, TEST_DIST_T> *hnswIndex = this->CastToHNSW(index);
-    ASSERT_EQ(hnswIndex->indexCapacity(), n);
+    // The capacity shouldn't change, should remain n + extra_cap.
+    ASSERT_EQ(index->indexCapacity(), curr_capacity);
 
     // Delete last vector, to get size % block_size == 0. size = 3
     VecSimIndex_DeleteVector(index, bs);
@@ -175,9 +173,9 @@ TYPED_TEST(HNSWTest, resizeNAlignIndex_largeInitialCapacity) {
     ASSERT_EQ(VecSimIndex_IndexSize(index), bs);
 
     // New capacity = initial capacity - block_size - number_of_vectors_to_align =
-    // 10  - 3 - 10 % 3 (1) = 6
-    size_t curr_capacity = hnswIndex->indexCapacity();
-    ASSERT_EQ(curr_capacity, n - bs - n % bs);
+    // 10 + 2 - 3 = 9
+    curr_capacity = index->indexCapacity();
+    ASSERT_EQ(curr_capacity, n + extra_cap - bs);
 
     // Delete all the vectors to decrease capacity by another bs.
     size_t i = 0;
@@ -185,29 +183,34 @@ TYPED_TEST(HNSWTest, resizeNAlignIndex_largeInitialCapacity) {
         VecSimIndex_DeleteVector(index, i);
         ++i;
     }
-    ASSERT_EQ(hnswIndex->indexCapacity(), bs);
-    // Add and delete a vector to achieve:
+    ASSERT_EQ(index->indexCapacity(), n + extra_cap - 2 * bs);
+    // Add and delete a vector twice to achieve:
     // size % block_size == 0 && size + bs <= capacity(3).
     // the capacity should be resized to zero
     GenerateAndAddVector<TEST_DATA_T>(index, dim, 0);
     VecSimIndex_DeleteVector(index, 0);
-    ASSERT_EQ(hnswIndex->indexCapacity(), 0);
+    GenerateAndAddVector<TEST_DATA_T>(index, dim, 0);
+    VecSimIndex_DeleteVector(index, 0);
+    ASSERT_EQ(index->indexCapacity(), 0);
 
     // Do it again. This time after adding a vector the capacity is increased by bs.
     // Upon deletion it will be resized to zero again.
     GenerateAndAddVector<TEST_DATA_T>(index, dim, 0);
-    ASSERT_EQ(hnswIndex->indexCapacity(), bs);
+    ASSERT_EQ(index->indexCapacity(), bs);
     VecSimIndex_DeleteVector(index, 0);
-    ASSERT_EQ(hnswIndex->indexCapacity(), 0);
+    ASSERT_EQ(index->indexCapacity(), 0);
 
     VecSimIndex_Free(index);
 }
 
 // Case 2: initial capacity is smaller than block_size.
-TYPED_TEST(HNSWTest, resizeNAlignIndex_largerBlockSize) {
+TYPED_TEST(HNSWTest, resizeIndex_largerBlockSize) {
     size_t dim = 4;
     size_t n = 4;
     size_t bs = 6;
+
+    // Initial capacity is rounded up to the block size.
+    size_t extra_cap = n % bs == 0 ? 0 : bs - n % bs;
 
     HNSWParams params = {
         .dim = dim, .metric = VecSimMetric_L2, .initialCapacity = n, .blockSize = bs};
@@ -215,31 +218,28 @@ TYPED_TEST(HNSWTest, resizeNAlignIndex_largerBlockSize) {
     VecSimIndex *index = this->CreateNewIndex(params);
 
     ASSERT_EQ(VecSimIndex_IndexSize(index), 0);
+    size_t curr_capacity = index->indexCapacity();
+    ASSERT_EQ(curr_capacity, n + extra_cap);
 
     // Add up to initial capacity.
     for (size_t i = 0; i < n; i++) {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
     }
 
-    HNSWIndex<TEST_DATA_T, TEST_DIST_T> *hnswIndex = this->CastToHNSW(index);
     // The capacity shouldn't change.
-    ASSERT_EQ(hnswIndex->indexCapacity(), n);
+    ASSERT_EQ(index->indexCapacity(), curr_capacity);
 
-    // Size equals capacity.
-    ASSERT_EQ(VecSimIndex_IndexSize(index), n);
-
-    // Add another vector - > the capacity is increased to a multiplication of block_size.
-    GenerateAndAddVector<TEST_DATA_T>(index, dim, n);
-    ASSERT_EQ(hnswIndex->indexCapacity(), bs);
-
-    // Size increased by 1.
-    ASSERT_EQ(VecSimIndex_IndexSize(index), n + 1);
+    // The capacity should be a multiplication of block_size.
+    ASSERT_EQ(index->indexCapacity(), bs);
 
     // Delete random vector.
     VecSimIndex_DeleteVector(index, 1);
 
     // The capacity should remain the same.
-    ASSERT_EQ(hnswIndex->indexCapacity(), bs);
+    ASSERT_EQ(index->indexCapacity(), bs);
+
+    // Size decreased by 1.
+    ASSERT_EQ(VecSimIndex_IndexSize(index), n - 1);
 
     VecSimIndex_Free(index);
 }
@@ -250,12 +250,17 @@ TYPED_TEST(HNSWTest, emptyIndex) {
     size_t n = 20;
     size_t bs = 6;
 
+    // Initial capacity is rounded up to the block size.
+    size_t extra_cap = n % bs == 0 ? 0 : bs - n % bs;
+
     HNSWParams params = {
         .dim = dim, .metric = VecSimMetric_L2, .initialCapacity = n, .blockSize = bs};
 
     VecSimIndex *index = this->CreateNewIndex(params);
 
     ASSERT_EQ(VecSimIndex_IndexSize(index), 0);
+    size_t curr_capacity = index->indexCapacity();
+    ASSERT_EQ(curr_capacity, n + extra_cap);
 
     // Try to remove from an empty index - should fail because label doesn't exist.
     VecSimIndex_DeleteVector(index, 0);
@@ -265,11 +270,11 @@ TYPED_TEST(HNSWTest, emptyIndex) {
 
     // Try to remove it.
     VecSimIndex_DeleteVector(index, 1);
-    // The capacity should change to be aligned with the block size.
 
-    HNSWIndex<TEST_DATA_T, TEST_DIST_T> *hnswIndex = this->CastToHNSW(index);
-    size_t new_capacity = hnswIndex->indexCapacity();
-    ASSERT_EQ(new_capacity, n - n % bs - bs);
+    // The capacity should be aligned with the block size.
+    size_t new_capacity = index->indexCapacity();
+    ASSERT_EQ(new_capacity, curr_capacity - bs);
+    ASSERT_EQ(new_capacity % bs, 0);
 
     // Size equals 0.
     ASSERT_EQ(VecSimIndex_IndexSize(index), 0);
@@ -277,7 +282,7 @@ TYPED_TEST(HNSWTest, emptyIndex) {
     // Try to remove it again.
     // The capacity should remain unchanged, as we are trying to delete a label that doesn't exist.
     VecSimIndex_DeleteVector(index, 1);
-    ASSERT_EQ(hnswIndex->indexCapacity(), new_capacity);
+    ASSERT_EQ(index->indexCapacity(), new_capacity);
     // Nor the size.
     ASSERT_EQ(VecSimIndex_IndexSize(index), 0);
 
@@ -505,16 +510,16 @@ TYPED_TEST(HNSWTest, test_hnsw_info) {
     VecSimIndex *index = this->CreateNewIndex(params);
 
     VecSimIndexInfo info = VecSimIndex_Info(index);
-    ASSERT_EQ(info.algo, VecSimAlgo_HNSWLIB);
-    ASSERT_EQ(info.hnswInfo.dim, d);
+    ASSERT_EQ(info.commonInfo.basicInfo.algo, VecSimAlgo_HNSWLIB);
+    ASSERT_EQ(info.commonInfo.basicInfo.dim, d);
     // Default args.
-    ASSERT_FALSE(info.hnswInfo.isMulti);
-    ASSERT_EQ(info.hnswInfo.blockSize, DEFAULT_BLOCK_SIZE);
+    ASSERT_FALSE(info.commonInfo.basicInfo.isMulti);
+    ASSERT_EQ(info.commonInfo.basicInfo.blockSize, DEFAULT_BLOCK_SIZE);
     ASSERT_EQ(info.hnswInfo.M, HNSW_DEFAULT_M);
     ASSERT_EQ(info.hnswInfo.efConstruction, HNSW_DEFAULT_EF_C);
     ASSERT_EQ(info.hnswInfo.efRuntime, HNSW_DEFAULT_EF_RT);
     ASSERT_DOUBLE_EQ(info.hnswInfo.epsilon, HNSW_DEFAULT_EPSILON);
-    ASSERT_EQ(info.hnswInfo.type, params.type);
+    ASSERT_EQ(info.commonInfo.basicInfo.type, params.type);
     VecSimIndex_Free(index);
 
     d = 1280;
@@ -525,16 +530,28 @@ TYPED_TEST(HNSWTest, test_hnsw_info) {
 
     index = this->CreateNewIndex(params);
     info = VecSimIndex_Info(index);
-    ASSERT_EQ(info.algo, VecSimAlgo_HNSWLIB);
-    ASSERT_EQ(info.hnswInfo.dim, d);
+    ASSERT_EQ(info.commonInfo.basicInfo.algo, VecSimAlgo_HNSWLIB);
+    ASSERT_EQ(info.commonInfo.basicInfo.dim, d);
     // User args.
-    ASSERT_FALSE(info.hnswInfo.isMulti);
-    ASSERT_EQ(info.hnswInfo.blockSize, bs);
+    ASSERT_FALSE(info.commonInfo.basicInfo.isMulti);
+    ASSERT_EQ(info.commonInfo.basicInfo.blockSize, bs);
     ASSERT_EQ(info.hnswInfo.efConstruction, 1000);
     ASSERT_EQ(info.hnswInfo.M, 200);
     ASSERT_EQ(info.hnswInfo.efRuntime, 500);
     ASSERT_EQ(info.hnswInfo.epsilon, 0.005);
-    ASSERT_EQ(info.hnswInfo.type, params.type);
+    ASSERT_EQ(info.commonInfo.basicInfo.type, params.type);
+    ASSERT_FALSE(info.commonInfo.basicInfo.isTiered);
+
+    // Validate that Static info returns the right restricted info as well.
+    VecSimIndexBasicInfo s_info = VecSimIndex_BasicInfo(index);
+    ASSERT_EQ(info.commonInfo.basicInfo.algo, s_info.algo);
+    ASSERT_EQ(info.commonInfo.basicInfo.dim, s_info.dim);
+    ASSERT_EQ(info.commonInfo.basicInfo.blockSize, s_info.blockSize);
+    ASSERT_EQ(info.commonInfo.basicInfo.type, s_info.type);
+    ASSERT_EQ(info.commonInfo.basicInfo.isMulti, s_info.isMulti);
+    ASSERT_EQ(info.commonInfo.basicInfo.type, s_info.type);
+    ASSERT_EQ(info.commonInfo.basicInfo.isTiered, s_info.isTiered);
+
     VecSimIndex_Free(index);
 }
 
@@ -578,10 +595,10 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     ASSERT_EQ(250, info.hnswInfo.efConstruction);
     ASSERT_EQ(400, info.hnswInfo.efRuntime);
     ASSERT_EQ(0.004, info.hnswInfo.epsilon);
-    ASSERT_EQ(0, info.hnswInfo.indexSize);
+    ASSERT_EQ(0, info.commonInfo.indexSize);
     ASSERT_EQ(-1, info.hnswInfo.max_level);
     ASSERT_EQ(-1, info.hnswInfo.entrypoint);
-    ASSERT_EQ(params.type, info.hnswInfo.type);
+    ASSERT_EQ(params.type, info.commonInfo.basicInfo.type);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
@@ -593,7 +610,7 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     VecSimIndex_AddVector(index, v, 1);
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(1, info.hnswInfo.indexSize);
+    ASSERT_EQ(1, info.commonInfo.indexSize);
     ASSERT_EQ(1, info.hnswInfo.entrypoint);
     ASSERT_GE(1, info.hnswInfo.max_level);
     compareHNSWIndexInfoToIterator(info, infoIter);
@@ -603,7 +620,7 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     VecSimIndex_DeleteVector(index, 1);
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(0, info.bfInfo.indexSize);
+    ASSERT_EQ(0, info.commonInfo.indexSize);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
@@ -613,7 +630,7 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     VecSimQueryResult_Free(res);
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(STANDARD_KNN, info.hnswInfo.last_mode);
+    ASSERT_EQ(STANDARD_KNN, info.commonInfo.lastMode);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
@@ -621,28 +638,28 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     VecSimQueryResult_Free(res);
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(RANGE_QUERY, info.hnswInfo.last_mode);
+    ASSERT_EQ(RANGE_QUERY, info.commonInfo.lastMode);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
     ASSERT_TRUE(VecSimIndex_PreferAdHocSearch(index, 1, 1, true));
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(HYBRID_ADHOC_BF, info.hnswInfo.last_mode);
+    ASSERT_EQ(HYBRID_ADHOC_BF, info.commonInfo.lastMode);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
     // Set the index size artificially so that BATCHES mode will be selected by the heuristics.
-    auto actual_element_count = this->CastToHNSW(index)->cur_element_count;
-    this->CastToHNSW(index)->cur_element_count = 1e6;
-    auto &label_lookup = this->CastToHNSW_Single(index)->label_lookup_;
+    auto actual_element_count = this->CastToHNSW(index)->curElementCount;
+    this->CastToHNSW(index)->curElementCount = 1e6;
+    auto &label_lookup = this->CastToHNSW_Single(index)->labelLookup;
     for (size_t i = 0; i < 1e6; i++) {
         label_lookup[i] = i;
     }
     ASSERT_FALSE(VecSimIndex_PreferAdHocSearch(index, 10, 1, true));
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(HYBRID_BATCHES, info.hnswInfo.last_mode);
+    ASSERT_EQ(HYBRID_BATCHES, info.commonInfo.lastMode);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
@@ -651,11 +668,11 @@ TYPED_TEST(HNSWTest, test_dynamic_hnsw_info_iterator) {
     ASSERT_TRUE(VecSimIndex_PreferAdHocSearch(index, 1, 10, false));
     info = VecSimIndex_Info(index);
     infoIter = VecSimIndex_InfoIterator(index);
-    ASSERT_EQ(HYBRID_BATCHES_TO_ADHOC_BF, info.hnswInfo.last_mode);
+    ASSERT_EQ(HYBRID_BATCHES_TO_ADHOC_BF, info.commonInfo.lastMode);
     compareHNSWIndexInfoToIterator(info, infoIter);
     VecSimInfoIterator_Free(infoIter);
 
-    this->CastToHNSW(index)->cur_element_count = actual_element_count;
+    this->CastToHNSW(index)->curElementCount = actual_element_count;
     VecSimIndex_Free(index);
 }
 TYPED_TEST(HNSWTest, test_query_runtime_params_default_build_args) {
@@ -878,8 +895,6 @@ TYPED_TEST(HNSWTest, hnsw_bad_params) {
         1,          // Will fail because 1/log(M).
         100000000,  // Will fail on M * 2 overflow.
         UINT16_MAX, // Will fail on M * 2 overflow.
-        UINT16_MAX /
-            2, // Will fail on this->allocator->callocate(max_elements_ * size_data_per_element_)
     };
     size_t len = sizeof(bad_M) / sizeof(size_t);
 
@@ -923,7 +938,7 @@ TYPED_TEST(HNSWTest, hnsw_delete_entry_point) {
 
     VecSimIndexInfo info = VecSimIndex_Info(index);
 
-    while (info.hnswInfo.indexSize > 0) {
+    while (info.commonInfo.indexSize > 0) {
         ASSERT_NO_THROW(VecSimIndex_DeleteVector(index, info.hnswInfo.entrypoint));
         info = VecSimIndex_Info(index);
     }
@@ -952,11 +967,6 @@ TYPED_TEST(HNSWTest, hnsw_override) {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
     }
     ASSERT_EQ(VecSimIndex_IndexSize(index), n);
-
-    // Try to override when overriding is not allowed.
-    TEST_DATA_T vec[dim];
-    GenerateVector<TEST_DATA_T>(vec, dim, n);
-    ASSERT_EQ(this->CastToHNSW_Single(index)->addVector(vec, 0, false), -1);
 
     // Insert again 300 vectors, the first 100 will be overwritten (deleted first).
     n = 300;
@@ -1121,9 +1131,9 @@ TYPED_TEST(HNSWTest, hnsw_batch_iterator_batch_size_1) {
 
 TYPED_TEST(HNSWTest, hnsw_batch_iterator_advanced) {
     size_t dim = 4;
-    size_t n = 1000;
+    size_t n = 500;
     size_t M = 8;
-    size_t ef = 1000;
+    size_t ef = n;
 
     HNSWParams params = {.dim = dim,
                          .metric = VecSimMetric_L2,
@@ -1184,8 +1194,11 @@ TYPED_TEST(HNSWTest, hnsw_batch_iterator_advanced) {
         if (iteration_num <= n / n_res) {
             runBatchIteratorSearchTest(batchIterator, n_res, verify_res, BY_ID);
         } else {
-            // In the last iteration there are n%iteration_num (=6) results left to return.
-            expected_ids.erase(expected_ids.begin()); // remove the first id
+            // In the last iteration there are n%n_res results left to return.
+            // remove the first ids that aren't going to be returned since we pass the index size.
+            for (size_t i = 0; i < n_res - n % n_res; i++) {
+                expected_ids.erase(expected_ids.begin());
+            }
             runBatchIteratorSearchTest(batchIterator, n_res, verify_res, BY_ID, n % n_res);
         }
     }
@@ -1490,13 +1503,15 @@ TYPED_TEST(HNSWTest, preferAdHocOptimization) {
         VecSimIndex *index = this->CreateNewIndex(params);
 
         // Set the index size artificially to be the required one.
-        this->CastToHNSW(index)->cur_element_count = index_size;
+        this->CastToHNSW(index)->curElementCount = index_size;
         for (size_t i = 0; i < index_size; i++) {
-            this->CastToHNSW_Single(index)->label_lookup_[i] = i;
+            this->CastToHNSW_Single(index)->labelLookup[i] = i;
         }
         ASSERT_EQ(VecSimIndex_IndexSize(index), index_size);
         bool res = VecSimIndex_PreferAdHocSearch(index, (size_t)(r * (float)index_size), k, true);
         ASSERT_EQ(res, comb.second);
+        // Clean-up.
+        this->CastToHNSW(index)->curElementCount = 0;
         VecSimIndex_Free(index);
     }
 
@@ -1509,13 +1524,9 @@ TYPED_TEST(HNSWTest, preferAdHocOptimization) {
     ASSERT_TRUE(VecSimIndex_PreferAdHocSearch(index, 0, 50, true));
 
     // Corner cases - subset size is greater than index size.
-    try {
-        VecSimIndex_PreferAdHocSearch(index, 1, 50, true);
-        FAIL() << "Expected std::runtime error";
-    } catch (std::runtime_error const &err) {
-        EXPECT_EQ(err.what(),
-                  std::string("internal error: subset size cannot be larger than index size"));
-    }
+    ASSERT_EQ(VecSimIndex_PreferAdHocSearch(index, 42, 50, true),
+              VecSimIndex_PreferAdHocSearch(index, 0, 50, true));
+
     VecSimIndex_Free(index);
 }
 
@@ -1572,10 +1583,13 @@ TYPED_TEST(HNSWTest, testCosine) {
 }
 
 TYPED_TEST(HNSWTest, testSizeEstimation) {
-    size_t dim = 128;
-    size_t n = 1000;
-    size_t bs = DEFAULT_BLOCK_SIZE;
-    size_t M = 32;
+    size_t dim = 256;
+    size_t n = 200;
+    size_t bs = 256;
+    size_t M = 64;
+
+    // Initial capacity is rounded up to the block size.
+    size_t extra_cap = n % bs == 0 ? 0 : bs - n % bs;
 
     HNSWParams params = {
         .dim = dim, .metric = VecSimMetric_L2, .initialCapacity = n, .blockSize = bs, .M = M};
@@ -1589,24 +1603,29 @@ TYPED_TEST(HNSWTest, testSizeEstimation) {
     // labels_lookup hash table has additional memory, since STL implementation chooses "an
     // appropriate prime number" higher than n as the number of allocated buckets (for n=1000, 1031
     // buckets are created)
-    estimation +=
-        (this->CastToHNSW_Single(index)->label_lookup_.bucket_count() - n) * sizeof(size_t);
+    estimation += (this->CastToHNSW_Single(index)->labelLookup.bucket_count() - (n + extra_cap)) *
+                  sizeof(size_t);
 
     ASSERT_EQ(estimation, actual);
 
+    // Fill the initial capacity + fill the last block.
     for (size_t i = 0; i < n; i++) {
-        GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
+        GenerateAndAddVector<TEST_DATA_T>(index, dim, i);
+    }
+    idType cur = n;
+    while (index->indexSize() % bs != 0) {
+        GenerateAndAddVector<TEST_DATA_T>(index, dim, cur++);
     }
 
-    // Estimate the memory delta of adding a full new block.
-    estimation = EstimateElementSize(params) * (bs % n + bs);
+    // Estimate the memory delta of adding a single vector that requires a full new block.
+    estimation = EstimateElementSize(params) * bs;
+    size_t before = index->getAllocationSize();
+    GenerateAndAddVector<TEST_DATA_T>(index, dim, bs, bs);
+    actual = index->getAllocationSize() - before;
 
-    actual = 0;
-    for (size_t i = 0; i < bs; i++) {
-        actual += GenerateAndAddVector<TEST_DATA_T>(index, dim, n + i, i);
-    }
-    ASSERT_GE(estimation * 1.01, actual);
-    ASSERT_LE(estimation * 0.99, actual);
+    // We check that the actual size is within 1% of the estimation.
+    ASSERT_GE(estimation, actual * 0.99);
+    ASSERT_LE(estimation, actual * 1.01);
 
     VecSimIndex_Free(index);
 }
@@ -1634,6 +1653,140 @@ TYPED_TEST(HNSWTest, testInitialSizeEstimation_No_InitialCapacity) {
     ASSERT_LE(actual, estimation + sizeof(size_t) + 2 * sizeof(size_t));
 
     VecSimIndex_Free(index);
+}
+
+TYPED_TEST(HNSWTest, testIncomingEdgesSize) {
+    size_t dim = 4;
+    size_t n = DEFAULT_BLOCK_SIZE;
+    size_t bs = DEFAULT_BLOCK_SIZE;
+    size_t efC = n;
+
+    // In this test we add identical vectors.
+    // Expected results:
+    // in level 0: Each node has room for 2 * M neighbour. As we insert identical vectors, due to
+    // the secondary sorting by id in the top candidates heap, the M top candidates nodes for each
+    // new node will be the nodes whose ids are the maximal. These nodes will be mutually connected
+    // to the new node, in addition to their existing neighbors (there will be no unidirectional
+    // edges). For higher levels (if the max level of the new node is higher then 0): For each
+    // level, if there are already M + 1 nodes on this level, the new node will be connected to the
+    // last M existing nodes. As the capacity of the existing node is full,
+    // these M last nodes will have to remove one of their neighbour, so one
+    // unidirectional for each node (total of M) will be added. Eventually, we expected that each
+    // vector at this level will have M incoming edges, except the first M vectors and the last M
+    // vectors. The M vectors whose ids are minimal at some level should end up with 0, 1, ..., M-1
+    // incoming edges respectively. The last M vectors will behave in a similar way (the vector with
+    // maximum id at a level should have 0 incoming edges, the one whose is the second last should
+    // have 1, etc...)
+
+    for (size_t M : {2, 4, 16, 32}) {
+        HNSWParams params = {.dim = dim,
+                             .metric = VecSimMetric_L2,
+                             .initialCapacity = n,
+                             .blockSize = bs,
+                             .M = M,
+                             .efConstruction = efC};
+        VecSimIndex *index = this->CreateNewIndex(params);
+
+        auto hnsw_index = this->CastToHNSW(index);
+        size_t inc_edges0 = 0;
+
+        // Calculate expected allocations overhead after adding n vectors
+        size_t allocations_overhead = VecSimAllocator::getAllocationOverheadSize();
+
+        // meta data per node per level
+        size_t size_links_per_level = hnsw_index->levelDataSize;
+
+        size_t size_label_lookup_node = getLabelsLookupNodeSize();
+
+        size_t initial_memory = index->getAllocationSize();
+        size_t metadata_overhead_estimation = 0;
+
+        // Count the number of nodes at each level of the graph.
+        std::vector<size_t> nodes_per_level_hist(100, 0);
+        for (size_t i = 0; i < n; i++) {
+
+            GenerateAndAddVector<TEST_DATA_T>(index, dim, i);
+
+            size_t elem_level = hnsw_index->getGraphDataByInternalId(i)->toplevel;
+
+            size_t high_levels_memory =
+                elem_level ? size_links_per_level * elem_level + allocations_overhead : 0;
+            metadata_overhead_estimation += size_label_lookup_node + high_levels_memory;
+            for (size_t j = 0; j <= elem_level; j++) {
+                nodes_per_level_hist[j] += 1;
+            }
+        }
+
+        size_t incoming_edges_total_count = 0;
+        std::vector<size_t> incoming_per_level_hist(hnsw_index->maxLevel + 1, 0);
+
+        size_t incoming_edges_memory_overhead = 0;
+        for (size_t level = 0; level <= hnsw_index->maxLevel; level++) {
+            size_t curr_visited_at_level_hist = 0;
+            for (size_t id = 0; id < n; id++) {
+                if (hnsw_index->getGraphDataByInternalId(id)->toplevel >= level) {
+                    // we expect to generate a new incoming edges vector for each new node at each
+                    // level.
+                    incoming_edges_memory_overhead +=
+                        sizeof(vecsim_stl::vector<idType>) + allocations_overhead;
+                    curr_visited_at_level_hist += 1;
+                    size_t curr_idx_at_level = curr_visited_at_level_hist - 1;
+                    // The index of the vector at the current level counting backwards.
+                    size_t curr_reverse_idx_at_level =
+                        nodes_per_level_hist[level] - curr_visited_at_level_hist;
+                    auto incomingEdges = hnsw_index->getLevelData(id, level).incomingEdges;
+                    incomingEdges->shrink_to_fit();
+                    size_t incoming_edges_count = incomingEdges->size();
+
+                    // if it is level 0 or there are less than M nodes at this level, none of them
+                    // should have incoming edges.
+                    if (level == 0 || nodes_per_level_hist[level] <= M + 1 ||
+                        curr_idx_at_level == 0 || curr_reverse_idx_at_level == 0) {
+                        ASSERT_EQ(incoming_edges_count, 0);
+                        continue;
+                    }
+                    if (curr_idx_at_level < M) { // this is one of the first M nodes
+                        ASSERT_EQ(incoming_edges_count, curr_idx_at_level);
+                    } else if (curr_reverse_idx_at_level < M) { // this is one of the last M nodes
+                        ASSERT_EQ(incoming_edges_count, curr_reverse_idx_at_level);
+                    } else {
+                        ASSERT_EQ(incoming_edges_count, M);
+                    }
+                    incoming_edges_total_count += incoming_edges_count;
+                    incoming_per_level_hist[level] += incoming_edges_count;
+                    // The first insertion to the incoming edges vector causes another allocation.
+                    incoming_edges_memory_overhead +=
+                        incoming_edges_count * sizeof(idType) + allocations_overhead;
+                }
+            }
+            // each node (except the first M and the last M) should have the same number of incoming
+            // edges.
+            if (level == 0 || nodes_per_level_hist[level] <= 2 * M) {
+                continue;
+            }
+            // Sum the number of incoming edges of the first or last M nodes
+            // (0 + 1 + ... + M - 1)
+            size_t edge_nodes_incoming_edges_sum = (M * (M - 1)) / 2;
+            size_t expected_incoming_edges =
+                (nodes_per_level_hist[level] - 2 * M) * M + edge_nodes_incoming_edges_sum * 2;
+            ASSERT_EQ(incoming_per_level_hist[level], expected_incoming_edges);
+        }
+
+        size_t total_estimation = metadata_overhead_estimation + incoming_edges_memory_overhead;
+        // Additional allocations for the data blocks (vector+meta).
+        total_estimation +=
+            hnsw_index->vectorBlocks.size() *
+            (hnsw_index->blockSize * (hnsw_index->elementGraphDataSize + hnsw_index->dataSize) +
+             2 * allocations_overhead + hnsw_index->alignment);
+
+        size_t add_vectors_memory_delta = index->getAllocationSize() - initial_memory;
+
+        ASSERT_EQ(total_estimation, add_vectors_memory_delta);
+        ASSERT_EQ(hnsw_index->checkIntegrity().unidirectional_connections,
+                  incoming_edges_total_count);
+
+        VecSimIndex_Free(index);
+    }
 }
 
 TYPED_TEST(HNSWTest, testTimeoutReturn) {
@@ -1853,15 +2006,15 @@ TYPED_TEST(HNSWTest, rangeQueryCosine) {
     VecSimIndex_Free(index);
 }
 
-TYPED_TEST(HNSWTest, HNSWSerialization_v2) {
+TYPED_TEST(HNSWTest, HNSWSerializationCurrentVersion) {
 
     size_t dim = 4;
-    size_t n = 1000;
+    size_t n = 1001;
     size_t n_labels[] = {n, 100};
     size_t M = 8;
     size_t ef = 10;
     double epsilon = 0.004;
-    size_t blockSize = 1;
+    size_t blockSize = 2;
     bool is_multi[] = {false, true};
     std::string multiToString[] = {"single", "multi_100labels_"};
 
@@ -1897,22 +2050,22 @@ TYPED_TEST(HNSWTest, HNSWSerialization_v2) {
 
         auto file_name = std::string(getenv("ROOT")) + "/tests/unit/data/1k-d4-L2-M8-ef_c10_" +
                          VecSimType_ToString(TypeParam::get_index_type()) + "_" + multiToString[i] +
-                         ".hnsw_v2";
+                         ".hnsw_current_version";
 
-        // Save the index with the default version (V2).
+        // Save the index with the default version (V3).
         hnsw_index->saveIndex(file_name);
 
         // Fetch info after saving, as memory size change during saving.
         VecSimIndexInfo info = VecSimIndex_Info(index);
-        ASSERT_EQ(info.algo, VecSimAlgo_HNSWLIB);
+        ASSERT_EQ(info.commonInfo.basicInfo.algo, VecSimAlgo_HNSWLIB);
         ASSERT_EQ(info.hnswInfo.M, M);
         ASSERT_EQ(info.hnswInfo.efConstruction, ef);
         ASSERT_EQ(info.hnswInfo.efRuntime, ef);
-        ASSERT_EQ(info.hnswInfo.indexSize, n);
-        ASSERT_EQ(info.hnswInfo.metric, VecSimMetric_L2);
-        ASSERT_EQ(info.hnswInfo.type, TypeParam::get_index_type());
-        ASSERT_EQ(info.hnswInfo.dim, dim);
-        ASSERT_EQ(info.hnswInfo.indexLabelCount, n_labels[i]);
+        ASSERT_EQ(info.commonInfo.indexSize, n);
+        ASSERT_EQ(info.commonInfo.basicInfo.metric, VecSimMetric_L2);
+        ASSERT_EQ(info.commonInfo.basicInfo.type, TypeParam::get_index_type());
+        ASSERT_EQ(info.commonInfo.basicInfo.dim, dim);
+        ASSERT_EQ(info.commonInfo.indexLabelCount, n_labels[i]);
 
         VecSimIndex_Free(index);
 
@@ -1924,17 +2077,17 @@ TYPED_TEST(HNSWTest, HNSWSerialization_v2) {
         ASSERT_TRUE(serialized_hnsw_index->checkIntegrity().valid_state);
 
         VecSimIndexInfo info2 = VecSimIndex_Info(serialized_index);
-        ASSERT_EQ(info2.algo, VecSimAlgo_HNSWLIB);
+        ASSERT_EQ(info2.commonInfo.basicInfo.algo, VecSimAlgo_HNSWLIB);
         ASSERT_EQ(info2.hnswInfo.M, M);
-        ASSERT_EQ(info2.hnswInfo.isMulti, is_multi[i]);
-        ASSERT_EQ(info2.hnswInfo.blockSize, blockSize);
+        ASSERT_EQ(info2.commonInfo.basicInfo.isMulti, is_multi[i]);
+        ASSERT_EQ(info2.commonInfo.basicInfo.blockSize, blockSize);
         ASSERT_EQ(info2.hnswInfo.efConstruction, ef);
         ASSERT_EQ(info2.hnswInfo.efRuntime, ef);
-        ASSERT_EQ(info2.hnswInfo.indexSize, n);
-        ASSERT_EQ(info2.hnswInfo.metric, VecSimMetric_L2);
-        ASSERT_EQ(info2.hnswInfo.type, TypeParam::get_index_type());
-        ASSERT_EQ(info2.hnswInfo.dim, dim);
-        ASSERT_EQ(info2.hnswInfo.indexLabelCount, n_labels[i]);
+        ASSERT_EQ(info2.commonInfo.indexSize, n);
+        ASSERT_EQ(info2.commonInfo.basicInfo.metric, VecSimMetric_L2);
+        ASSERT_EQ(info2.commonInfo.basicInfo.type, TypeParam::get_index_type());
+        ASSERT_EQ(info2.commonInfo.basicInfo.dim, dim);
+        ASSERT_EQ(info2.commonInfo.indexLabelCount, n_labels[i]);
         ASSERT_EQ(info2.hnswInfo.epsilon, epsilon);
 
         // Check the functionality of the loaded index.
@@ -1950,85 +2103,6 @@ TYPED_TEST(HNSWTest, HNSWSerialization_v2) {
 
         // Clean up.
         remove(file_name.c_str());
-        VecSimIndex_Free(serialized_index);
-    }
-}
-
-TYPED_TEST(HNSWTest, LoadHNSWSerialized_v1) {
-
-    size_t dim = 4;
-    size_t n = 1000;
-    size_t n_labels[] = {n, 100};
-    size_t M_serialized = 8;
-    size_t M_param = 5;
-    size_t ef_serialized = 10;
-    size_t ef_param = 12;
-    bool is_multi[] = {false, true};
-    std::string multiToString[] = {"single", "multi_100labels_"};
-
-    HNSWParams params{.type = TypeParam::get_index_type(),
-                      .dim = dim,
-                      .metric = VecSimMetric_L2,
-                      .M = M_param,
-                      .efConstruction = ef_param,
-                      .efRuntime = ef_param};
-    for (size_t i = 0; i < 2; ++i) {
-        // Set index type.
-        params.multi = is_multi[i];
-
-        auto file_name = std::string(getenv("ROOT")) + "/tests/unit/data/1k-d4-L2-M8-ef_c10_" +
-                         VecSimType_ToString(TypeParam::get_index_type()) + "_" + multiToString[i] +
-                         ".hnsw_v1";
-
-        // Try to load with an invalid type
-        params.type = VecSimType_INT32;
-        ASSERT_EXCEPTION_MESSAGE(HNSWFactory::NewIndex(file_name, &params), std::runtime_error,
-                                 "Cannot load index: bad index data type");
-        // Restore value.
-        params.type = TypeParam::get_index_type();
-
-        // Create new index from file
-        VecSimIndex *serialized_index = HNSWFactory::NewIndex(file_name, &params);
-        auto *serialized_hnsw_index = this->CastToHNSW(serialized_index);
-
-        // Verify that the index was loaded as expected.
-        ASSERT_TRUE(serialized_hnsw_index->checkIntegrity().valid_state);
-
-        VecSimIndexInfo info2 = VecSimIndex_Info(serialized_index);
-        ASSERT_EQ(info2.algo, VecSimAlgo_HNSWLIB);
-        // Check that M is taken from file and not from @params.
-        ASSERT_EQ(info2.hnswInfo.M, M_serialized);
-        ASSERT_NE(info2.hnswInfo.M, M_param);
-
-        ASSERT_EQ(info2.hnswInfo.isMulti, is_multi[i]);
-
-        // Check it was initalized with the default blockSize value.
-        ASSERT_EQ(info2.hnswInfo.blockSize, DEFAULT_BLOCK_SIZE);
-
-        // Check that ef is taken from file and not from @params.
-        ASSERT_EQ(info2.hnswInfo.efConstruction, ef_serialized);
-        ASSERT_EQ(info2.hnswInfo.efRuntime, ef_serialized);
-        ASSERT_NE(info2.hnswInfo.efRuntime, ef_param);
-        ASSERT_NE(info2.hnswInfo.efConstruction, ef_param);
-
-        ASSERT_EQ(info2.hnswInfo.indexSize, n);
-        ASSERT_EQ(info2.hnswInfo.metric, VecSimMetric_L2);
-        ASSERT_EQ(info2.hnswInfo.type, TypeParam::get_index_type());
-        ASSERT_EQ(info2.hnswInfo.dim, dim);
-        ASSERT_EQ(info2.hnswInfo.indexLabelCount, n_labels[i]);
-        // Check it was initalized with the default epsilon value.
-        ASSERT_EQ(info2.hnswInfo.epsilon, HNSW_DEFAULT_EPSILON);
-
-        // Check the functionality of the loaded index.
-
-        // Add and delete vector
-        GenerateAndAddVector<TEST_DATA_T>(serialized_index, dim, n);
-
-        VecSimIndex_DeleteVector(serialized_index, 1);
-
-        size_t n_per_label = n / n_labels[i];
-        ASSERT_TRUE(serialized_hnsw_index->checkIntegrity().valid_state);
-        ASSERT_EQ(VecSimIndex_IndexSize(serialized_index), n + 1 - n_per_label);
         VecSimIndex_Free(serialized_index);
     }
 }
@@ -2089,12 +2163,12 @@ TYPED_TEST(HNSWTest, markDelete) {
 
     // Add a new vector, make sure it has no link to a deleted vector
     GenerateAndAddVector<TEST_DATA_T>(index, dim, n, n);
-    for (size_t level = 0; level <= this->CastToHNSW(index)->element_levels_[n]; level++) {
-        idType *neighbors = this->CastToHNSW(index)->get_linklist_at_level(n, level);
-        linkListSize size = this->CastToHNSW(index)->getListCount(neighbors);
-        for (size_t idx = 0; idx < size; idx++) {
-            ASSERT_TRUE(neighbors[idx] % 2 != ep_reminder)
-                << "Got a link to " << neighbors[idx] << " on level " << level;
+    for (size_t level = 0; level <= this->CastToHNSW(index)->getGraphDataByInternalId(n)->toplevel;
+         level++) {
+        LevelData &cur = this->CastToHNSW(index)->getLevelData(n, level);
+        for (size_t idx = 0; idx < cur.numLinks; idx++) {
+            ASSERT_TRUE(cur.links[idx] % 2 != ep_reminder)
+                << "Got a link to " << cur.links[idx] << " on level " << level;
         }
     }
 
@@ -2133,7 +2207,7 @@ TYPED_TEST(HNSWTest, allMarkedDeletedLevel) {
     // Add vectors to the index until we have 10 multi-layered vectors.
     do {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, max_id, max_id);
-        if (this->CastToHNSW(index)->element_levels_[max_id] > 0) {
+        if (this->CastToHNSW(index)->getGraphDataByInternalId(max_id)->toplevel > 0) {
             num_multi_layered++;
         }
         max_id++;
@@ -2141,7 +2215,7 @@ TYPED_TEST(HNSWTest, allMarkedDeletedLevel) {
 
     // Mark all vectors with multi-layers as deleted.
     for (labelType label = 0; label < max_id; label++) {
-        if (this->CastToHNSW(index)->element_levels_[label] > 0) {
+        if (this->CastToHNSW(index)->getGraphDataByInternalId(label)->toplevel > 0) {
             this->CastToHNSW(index)->markDelete(label);
         }
     }
@@ -2151,7 +2225,7 @@ TYPED_TEST(HNSWTest, allMarkedDeletedLevel) {
     // Re-add a new vector until its level is equal to the max level of the index.
     do {
         GenerateAndAddVector<TEST_DATA_T>(index, dim, max_id, max_id);
-    } while (this->CastToHNSW(index)->element_levels_[max_id] < max_level);
+    } while (this->CastToHNSW(index)->getGraphDataByInternalId(max_id)->toplevel < max_level);
 
     // If we passed the previous loop, it means that we successfully added a vector without invalid
     // memory access.
@@ -2162,173 +2236,49 @@ TYPED_TEST(HNSWTest, allMarkedDeletedLevel) {
     VecSimIndex_Free(index);
 }
 
-TYPED_TEST(HNSWTest, parallelSearchKnn) {
-    size_t n = 1000;
-    size_t k = 11;
-    size_t dim = 4;
+TYPED_TEST(HNSWTest, repairNodeConnectionsBasic) {
+    size_t dim = 8;
+    size_t n = dim;
+    size_t M = 8;
 
-    HNSWParams params = {.dim = dim,
-                         .metric = VecSimMetric_L2,
-                         .initialCapacity = n,
-                         .M = 16,
-                         .efConstruction = 200};
+    HNSWParams params = {.dim = dim, .metric = VecSimMetric_L2, .M = M};
     VecSimIndex *index = this->CreateNewIndex(params);
+    auto *hnsw_index = this->CastToHNSW(index);
 
+    // Add 8 vectors, expect to get a full graph in level 0 (all nodes pairs are connected)
+    TEST_DATA_T vec[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     for (size_t i = 0; i < n; i++) {
-        GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
+        vec[i] = 1.0;
+        VecSimIndex_AddVector(index, vec, i);
+        vec[i] = 0.0;
     }
-    ASSERT_EQ(VecSimIndex_IndexSize(index), n);
-
-    std::atomic_int successful_searches(0);
-    // Run parallel searches where every searching thread expects to get different labels as results
-    // (determined by the thread id), which are labels in the range [50+myID-5, 50+myID+5].
-    auto parallel_search = [&](int myID) {
-        TEST_DATA_T query_val = 50 + myID;
-        TEST_DATA_T query[dim];
-        GenerateVector<TEST_DATA_T>(query, dim, query_val);
-        auto verify_res = [&](size_t id, double score, size_t res_index) {
-            // We expect to get the results with increasing order of the distance between the res
-            // label and the query val (query_val, query_val-1, query_val+1, query_val-2,
-            // query_val+2, ...) The score is the L2 distance between the vectors that correspond
-            // the ids.
-            size_t diff_id = (id > query_val) ? (id - query_val) : (query_val - id);
-            ASSERT_EQ(diff_id, (res_index + 1) / 2);
-            ASSERT_EQ(score, (dim * (diff_id * diff_id)));
-        };
-        runTopKSearchTest(index, query, k, verify_res);
-        successful_searches++;
-    };
-
-    size_t memory_before = index->info().hnswInfo.memory;
-    size_t n_threads = 16;
-    std::thread thread_objs[n_threads];
-    for (size_t i = 0; i < n_threads; i++) {
-        thread_objs[i] = std::thread(parallel_search, i);
-    }
-    for (size_t i = 0; i < n_threads; i++) {
-        thread_objs[i].join();
-    }
-    ASSERT_EQ(successful_searches, n_threads);
-    // Make sure that we properly update the allocator atomically during the searches. The expected
-    // Memory delta should only be the visited nodes handler added to the pool. Note that the
-    // initial pool size is 1, so we subtract 1 from the current pool size to get the delta.
-    size_t expected_memory = memory_before + (index->info().hnswInfo.visitedNodesPoolSize - 1) *
-                                                 (sizeof(VisitedNodesHandler) + sizeof(tag_t) * n +
-                                                  2 * sizeof(size_t) + sizeof(void *));
-    ASSERT_EQ(expected_memory, index->info().hnswInfo.memory);
-
-    VecSimIndex_Free(index);
-}
-
-TYPED_TEST(HNSWTest, parallelSearchCombined) {
-    size_t n = 1000;
-    size_t k = 11;
-    size_t dim = 4;
-
-    HNSWParams params = {.dim = dim,
-                         .metric = VecSimMetric_L2,
-                         .initialCapacity = n,
-                         .M = 16,
-                         .efConstruction = 200};
-    VecSimIndex *index = this->CreateNewIndex(params);
-
     for (size_t i = 0; i < n; i++) {
-        GenerateAndAddVector<TEST_DATA_T>(index, dim, i, i);
+        LevelData &cur = hnsw_index->getLevelData(i, 0);
+        ASSERT_EQ(cur.numLinks, n - 1);
     }
-    ASSERT_EQ(VecSimIndex_IndexSize(index), n);
 
-    std::atomic_int successful_searches(0);
-
-    /* Run parallel searches of three kinds: KNN, range, and batched search. */
-
-    // In knn, we expect to get different labels as results (determined by the thread id), which are
-    // labels in the range [50+myID-5, 50+myID+5].
-    auto parallel_knn_search = [&](int myID) {
-        TEST_DATA_T query_val = 50 + myID;
-        TEST_DATA_T query[dim];
-        GenerateVector<TEST_DATA_T>(query, dim, query_val);
-        auto verify_res = [&](size_t id, double score, size_t res_index) {
-            // We expect to get the results with increasing order of the distance between the res
-            // label and the query val (query_val, query_val-1, query_val+1, query_val-2,
-            // query_val+2, ...) The score is the L2 distance between the vectors that correspond
-            // the ids.
-            size_t diff_id = std::abs(id - query_val);
-            ASSERT_EQ(diff_id, (res_index + 1) / 2);
-            ASSERT_EQ(score, (dim * (diff_id * diff_id)));
-        };
-        runTopKSearchTest(index, query, k, verify_res);
-        successful_searches++;
-    };
-
-    auto parallel_range_search = [&](int myID) {
-        TEST_DATA_T pivot_id = 100 + myID;
-        TEST_DATA_T query[dim];
-        GenerateVector<TEST_DATA_T>(query, dim, pivot_id);
-        auto verify_res_by_score = [&](size_t id, double score, size_t res_index) {
-            size_t diff_id = std::abs(id - pivot_id);
-            ASSERT_EQ(diff_id, (res_index + 1) / 2);
-            ASSERT_EQ(score, dim * (diff_id * diff_id));
-        };
-        uint expected_num_results = 11;
-        // To get 11 results in the range [pivot_id-5, pivot_id+5], set the radius as the L2 score
-        // in the boundaries.
-        double radius = (double)dim * pow((double)expected_num_results / 2, 2);
-        runRangeQueryTest(index, query, radius, verify_res_by_score, expected_num_results,
-                          BY_SCORE);
-        successful_searches++;
-    };
-
-    auto parallel_batched_search = [&](int myID) {
-        TEST_DATA_T query[dim];
-        GenerateVector<TEST_DATA_T>(query, dim, n);
-
-        VecSimBatchIterator *batchIterator = VecSimBatchIterator_New(index, query, nullptr);
-        size_t iteration_num = 0;
-
-        // Get the 5 vectors whose ids are the maximal among those that hasn't been returned yet
-        // in every iteration. The results order should be sorted by their score (distance from the
-        // query vector), which means sorted from the largest id to the lowest.
-        // Run different number of iterations for every thread id.
-        size_t total_iterations = myID;
-        size_t n_res = 5;
-        while (VecSimBatchIterator_HasNext(batchIterator) && iteration_num < total_iterations) {
-            std::vector<size_t> expected_ids(n_res);
-            for (size_t i = 0; i < n_res; i++) {
-                expected_ids[i] = (n - iteration_num * n_res - i - 1);
-            }
-            auto verify_res = [&](size_t id, double score, size_t res_index) {
-                ASSERT_TRUE(expected_ids[res_index] == id);
-            };
-            runBatchIteratorSearchTest(batchIterator, n_res, verify_res);
-            iteration_num++;
-        }
-        ASSERT_EQ(iteration_num, total_iterations);
-        VecSimBatchIterator_Free(batchIterator);
-        successful_searches++;
-    };
-
-    size_t n_threads = 15;
-    std::thread thread_objs[n_threads];
-    size_t memory_before = index->info().hnswInfo.memory;
-    for (size_t i = 0; i < n_threads; i++) {
-        if (i % 3 == 0) {
-            thread_objs[i] = std::thread(parallel_knn_search, i);
-        } else if (i % 3 == 1) {
-            thread_objs[i] = std::thread(parallel_range_search, i);
-        } else {
-            thread_objs[i] = std::thread(parallel_batched_search, i);
-        }
+    // Mark element 0 as deleted, and repair all of its neighbors.
+    hnsw_index->markDelete(0);
+    ASSERT_EQ(this->CastToHNSW(index)->checkIntegrity().connections_to_repair, n - 1);
+    for (size_t i = 1; i < n; i++) {
+        hnsw_index->repairNodeConnections(i, 0);
+        // After the repair expect that to have all nodes except for element 0 as neighbors.
+        LevelData &cur = hnsw_index->getLevelData(i, 0);
+        ASSERT_EQ(cur.numLinks, n - 2);
     }
-    for (size_t i = 0; i < n_threads; i++) {
-        thread_objs[i].join();
+
+    // Mark elements 1 and 2 as deleted.
+    hnsw_index->markDelete(1);
+    hnsw_index->markDelete(2);
+    for (size_t i = 3; i < n; i++) {
+        hnsw_index->repairNodeConnections(i, 0);
+        // After the repair expect that to have all nodes except for elements 0-2 as neighbors.
+        LevelData &cur = hnsw_index->getLevelData(i, 0);
+        ASSERT_EQ(cur.numLinks, n - 4);
     }
-    ASSERT_EQ(successful_searches, n_threads);
-    // Make sure that we properly update the allocator atomically during the searches.
-    // Memory delta should only be the visited nodes handler added to the pool. Note that the
-    // initial pool size is 1, so we subtract 1 from the current pool size to get the delta.
-    size_t expected_memory = memory_before + (index->info().hnswInfo.visitedNodesPoolSize - 1) *
-                                                 (sizeof(VisitedNodesHandler) + sizeof(tag_t) * n +
-                                                  2 * sizeof(size_t) + sizeof(void *));
-    ASSERT_EQ(expected_memory, index->info().hnswInfo.memory);
+
+    // For completeness, we also check index integrity.
+    ASSERT_TRUE(this->CastToHNSW(index)->checkIntegrity().valid_state);
+
     VecSimIndex_Free(index);
 }

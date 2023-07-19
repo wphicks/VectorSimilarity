@@ -11,15 +11,15 @@
 #include "VecSim/utils/updatable_heap.h"
 #include "VecSim/utils/vec_utils.h"
 #include "test_utils.h"
-#include "VecSim/utils/serializer.h"
 #include "VecSim/utils/vecsim_results_container.h"
 #include "VecSim/algorithms/hnsw/hnsw.h"
-#include "VecSim/algorithms/hnsw/hnsw_factory.h"
+#include "VecSim/index_factories/hnsw_factory.h"
 
 #include <cstdlib>
 #include <limits>
 #include <cmath>
 #include <random>
+#include <cstdarg>
 
 template <typename index_type_t>
 class CommonIndexTest : public ::testing::Test {};
@@ -204,25 +204,29 @@ TYPED_TEST(UtilsTests, Max_Updatable_Heap) {
     ASSERT_TRUE(heap.empty());
 
     // Inserting data with the same priority
-    heap.emplace(priorities[SECOND], 1);
-    heap.emplace(priorities[FIRST], 55);
-    heap.emplace(priorities[SECOND], 3);
     heap.emplace(priorities[SECOND], 2);
+    heap.emplace(priorities[FIRST], 1);
+    heap.emplace(priorities[SECOND], 4);
+    heap.emplace(priorities[SECOND], 3);
 
     ASSERT_EQ(heap.size(), 4);
     ASSERT_FALSE(heap.empty());
-    p = {priorities[FIRST], 55};
+    p = {priorities[FIRST], 1};
     ASSERT_TRUE(heap.top() == p);
 
-    heap.emplace(priorities[THIRD], 55); // Update priority
+    heap.emplace(priorities[THIRD], 1); // Update priority
 
     ASSERT_EQ(heap.size(), 4); // Same size after update
     ASSERT_FALSE(heap.empty());
 
     // Make sure each pop deletes a single element, even if some have the same priority.
+    // Also, make sure the elements are popped in the correct order (highest priority first, and on
+    // a tie - the element with the highest value).
     size_t len = heap.size();
     for (size_t i = len; i > 0; i--) {
         ASSERT_EQ(heap.size(), i);
+        ASSERT_EQ(heap.top().second, i);
+        ASSERT_EQ(heap.top().first, i == 1 ? priorities[THIRD] : priorities[SECOND]);
         ASSERT_FALSE(heap.empty());
         heap.pop();
     }
@@ -385,6 +389,7 @@ protected:
 
     std::string file_name;
 };
+
 TEST_F(SerializerTest, HNSWSerialzer) {
 
     this->file_name = std::string(getenv("ROOT")) + "/tests/unit/data/bad_index.hnsw";
@@ -398,16 +403,73 @@ TEST_F(SerializerTest, HNSWSerialzer) {
     Serializer::writeBinaryPOD(output, 0);
     output.flush();
     ASSERT_EXCEPTION_MESSAGE(HNSWFactory::NewIndex(this->file_name), std::runtime_error,
-                             "Cannot load index: bad encoding version");
+                             "Cannot load index: deprecated encoding version: 0");
+
+    output.seekp(0, std::ios_base::beg);
+    Serializer::writeBinaryPOD(output, 42);
+    output.flush();
+    ASSERT_EXCEPTION_MESSAGE(HNSWFactory::NewIndex(this->file_name), std::runtime_error,
+                             "Cannot load index: bad encoding version: 42");
 
     // Test WRONG index algorithm exception
     // Use a valid version
     output.seekp(0, std::ios_base::beg);
 
-    Serializer::writeBinaryPOD(output, Serializer::EncodingVersion_V2);
-    Serializer::writeBinaryPOD(output, VecSimAlgo_BF);
-    output.close();
+    Serializer::writeBinaryPOD(output, Serializer::EncodingVersion_V3);
+    Serializer::writeBinaryPOD(output, 42);
+    output.flush();
+
+    ASSERT_EXCEPTION_MESSAGE(
+        HNSWFactory::NewIndex(this->file_name), std::runtime_error,
+        "Cannot load index: Expected HNSW file but got algorithm type: Unknown (corrupted file?)");
+
+    // Test WRONG index data type
+    // Use a valid version
+    output.seekp(0, std::ios_base::beg);
+
+    Serializer::writeBinaryPOD(output, Serializer::EncodingVersion_V3);
+    Serializer::writeBinaryPOD(output, VecSimAlgo_HNSWLIB);
+    Serializer::writeBinaryPOD(output, size_t(128));
+
+    Serializer::writeBinaryPOD(output, 42);
+    output.flush();
 
     ASSERT_EXCEPTION_MESSAGE(HNSWFactory::NewIndex(this->file_name), std::runtime_error,
-                             "Cannot load index: bad algorithm type");
+                             "Cannot load index: bad index data type: Unknown (corrupted file?)");
+
+    output.close();
+}
+
+struct logCtx {
+public:
+    std::vector<std::string> logBuffer;
+    std::string prefix;
+};
+
+void test_log_impl(void *ctx, const char *message) {
+    logCtx *log = (logCtx *)ctx;
+    std::string msg = log->prefix + message;
+    log->logBuffer.push_back(msg);
+}
+
+TEST(CommonAPITest, testlog) {
+
+    logCtx log;
+    log.prefix = "test log prefix: ";
+
+    BFParams bfParams = {.dim = 1, .metric = VecSimMetric_L2, .initialCapacity = 0, .blockSize = 5};
+    VecSimParams params = {
+        .algo = VecSimAlgo_BF, .algoParams = {.bfParams = BFParams{bfParams}}, .logCtx = &log};
+    auto *index =
+        dynamic_cast<BruteForceIndex<float, float> *>(BruteForceFactory::NewIndex(&params));
+    VecSim_SetLogCallbackFunction(test_log_impl);
+
+    index->log("test log message no fmt");
+    index->log("test log message %s %s", "with", "args");
+
+    ASSERT_EQ(log.logBuffer.size(), 2);
+    ASSERT_EQ(log.logBuffer[0], "test log prefix: test log message no fmt");
+    ASSERT_EQ(log.logBuffer[1], "test log prefix: test log message with args");
+
+    VecSimIndex_Free(index);
 }
